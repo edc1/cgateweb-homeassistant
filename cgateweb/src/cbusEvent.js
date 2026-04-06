@@ -137,15 +137,19 @@ class CBusEvent {
                 : this._rawEvent.slice(thirdSpace + 1, fourthSpace);
             if (levelToken) {
                 if (this._isDigits(levelToken)) {
+                    // Plain integer level (e.g. "lighting ramp 254/56/4 128")
                     this._levelRaw = parseInt(levelToken, 10);
                     this._level = this._levelRaw;
                 } else {
-                    // Token is not a plain integer (e.g. UUID in 730 events);
-                    // look for a level=N key-value pair in the remainder.
-                    const levelIndex = this._rawEvent.indexOf('level=', thirdSpace + 1);
+                    // Non-integer token (e.g. UUID in 730 events); prefer level=N key-value
+                    // Search for ' level=' (space-prefixed) to avoid matching inside other keys
+                    const levelIndex = this._rawEvent.indexOf(' level=', thirdSpace);
                     if (levelIndex !== -1) {
-                        const levelPart = this._rawEvent.slice(levelIndex + 6);
-                        this._levelRaw = this._extractLeadingInt(levelPart);
+                        this._levelRaw = this._extractLeadingInt(this._rawEvent.slice(levelIndex + 7));
+                        this._level = this._levelRaw;
+                    } else {
+                        // Fall back to extracting leading digits from the token itself
+                        this._levelRaw = this._extractLeadingInt(levelToken);
                         this._level = this._levelRaw;
                     }
                 }

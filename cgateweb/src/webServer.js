@@ -47,6 +47,7 @@ class WebServer {
         this.eventStream = options.eventStream || null;
         this._sseKeepaliveMs = options._sseKeepaliveMs || 15000;
         this.getStatus = options.getStatus || (() => ({}));
+        this.deviceStateManager = options.deviceStateManager || null;
         this.apiKey = options.apiKey || null;
         this.allowUnauthenticatedMutations = options.allowUnauthenticatedMutations === true;
         this.allowedOrigins = Array.isArray(options.allowedOrigins)
@@ -62,6 +63,8 @@ class WebServer {
                 : 120
         );
         this._mutationRequestLog = new Map();
+        this._haAreasCache = null;
+        this._haAreasCacheTime = 0;
         this.logger = createLogger({ component: 'WebServer' });
         this._server = null;
         this._parser = new CbusProjectParser();
@@ -112,6 +115,7 @@ class WebServer {
             }
 
             this._setCorsHeaders(req, res);
+            res.setHeader('X-Content-Type-Options', 'nosniff');
 
             if (req.method === 'OPTIONS') {
                 res.writeHead(204);
@@ -145,6 +149,12 @@ class WebServer {
             }
             if (urlPath === '/api/status' && req.method === 'GET') {
                 return this._handleGetStatus(req, res);
+            }
+            if (urlPath === '/api/dashboard' && req.method === 'GET') {
+                return this._handleGetDashboard(req, res);
+            }
+            if (urlPath === '/api/areas' && req.method === 'GET') {
+                return await this._handleGetAreas(req, res);
             }
             if (urlPath === '/healthz' && req.method === 'GET') {
                 return this._handleHealth(req, res);
@@ -365,6 +375,140 @@ class WebServer {
         });
     }
 
+    _handleGetDashboard(_req, res) {
+        const status = this.getStatus();
+        const labels = this.labelLoader.getLabelsObject();
+        const labelCount = Object.keys(labels).length;
+
+        // Build device list from device state manager
+        const devices = [];
+        if (this.deviceStateManager) {
+            const allLastSeen = this.deviceStateManager.getAllLastSeen();
+            const allLevels = this.deviceStateManager.getAllLevels
+                ? this.deviceStateManager.getAllLevels()
+                : new Map();
+            for (const [address, lastSeen] of allLastSeen) {
+                const level = allLevels.get(address);
+                devices.push({
+                    address,
+                    level: level !== undefined ? level : null,
+                    label: labels[address] || null,
+                    lastSeen
+                });
+            }
+            devices.sort((a, b) => b.lastSeen - a.lastSeen);
+        }
+
+        // Recent events from event stream
+        const recentEvents = this.eventStream
+            ? this.eventStream.getRecent().slice(-50)
+            : [];
+
+        this._sendJSON(res, 200, {
+            bridge: {
+                version: status.version,
+                uptime: status.uptime,
+                ready: status.ready,
+                lifecycle: status.lifecycle
+            },
+            connections: status.connections,
+            metrics: status.metrics,
+            discovery: status.discovery,
+            labels: { count: labelCount },
+            devices: {
+                total: devices.length,
+                active: devices.filter(d => d.lastSeen > Date.now() - 86400000).length,
+                list: devices.slice(0, 200)
+            },
+            recentEvents: recentEvents.length
+        });
+    }
+
+    async _handleGetAreas(_req, res) {
+        // Collect areas from label file
+        const labelAreas = new Set();
+        if (this.labelLoader) {
+            const areasMap = this.labelLoader.getLabelData?.()?.areas;
+            if (areasMap) {
+                const values = areasMap instanceof Map ? areasMap.values() : Object.values(areasMap);
+                for (const area of values) {
+                    if (area) labelAreas.add(area);
+                }
+            }
+        }
+
+        // Fetch areas from Home Assistant Supervisor API (cached 30s)
+        let haAreas = [];
+        const supervisorToken = process.env.SUPERVISOR_TOKEN;
+        if (supervisorToken) {
+            const now = Date.now();
+            if (this._haAreasCache && now - this._haAreasCacheTime < 30000) {
+                haAreas = this._haAreasCache;
+            } else {
+                try {
+                    const http = require('http');
+                    const data = await new Promise((resolve) => {
+                        const tmpl = '{{ areas() | map("area_name") | list | to_json }}';
+                        const postBody = JSON.stringify({ template: tmpl });
+                        const req = http.request('http://supervisor/core/api/template', {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${supervisorToken}`,
+                                'Content-Type': 'application/json',
+                                'Content-Length': Buffer.byteLength(postBody)
+                            },
+                            timeout: 5000
+                        }, (resp) => {
+                            let body = '';
+                            resp.on('data', (chunk) => { body += chunk; });
+                            resp.on('end', () => {
+                                this.logger.debug(`Area API HTTP ${resp.statusCode}, body length: ${body.length}`);
+                                try { resolve(JSON.parse(body)); } catch { resolve(null); }
+                            });
+                        });
+                        req.on('error', (e) => { this.logger.warn('Area API request error:', e.message); resolve(null); });
+                        req.on('timeout', () => { this.logger.warn('Area API request timeout'); req.destroy(); resolve(null); });
+                        req.write(postBody);
+                        req.end();
+                    });
+                    this.logger.debug(`Area template response: isArray=${Array.isArray(data)}, count=${Array.isArray(data) ? data.length : 0}`);
+                    if (Array.isArray(data)) {
+                        for (const name of data) {
+                            if (typeof name === 'string' && name) {
+                                haAreas.push({ name, source: 'homeassistant' });
+                            }
+                        }
+                        this._haAreasCache = haAreas;
+                        this._haAreasCacheTime = now;
+                    }
+                } catch (err) {
+                    this.logger.warn('Failed to fetch HA areas:', err.message || err);
+                }
+            }
+        }
+
+        // Merge: HA areas + label-file areas, deduplicated by name (case-insensitive)
+        const seen = new Set();
+        const merged = [];
+        for (const ha of haAreas) {
+            const key = ha.name.toLowerCase();
+            if (!seen.has(key)) {
+                seen.add(key);
+                merged.push({ name: ha.name, source: 'homeassistant' });
+            }
+        }
+        for (const name of labelAreas) {
+            const key = name.toLowerCase();
+            if (!seen.has(key)) {
+                seen.add(key);
+                merged.push({ name, source: 'labels' });
+            }
+        }
+        merged.sort((a, b) => a.name.localeCompare(b.name));
+
+        this._sendJSON(res, 200, { areas: merged });
+    }
+
     _handleHealth(_req, res) {
         const status = this.getStatus();
         this._sendJSON(res, 200, {
@@ -484,30 +628,30 @@ class WebServer {
 
     _setCorsHeaders(req, res) {
         const requestOrigin = req.headers.origin;
-        let origin = null;
         if (this.allowedOrigins && this.allowedOrigins.length > 0) {
-            const isAllowed = requestOrigin && this.allowedOrigins.includes(requestOrigin);
-            origin = isAllowed ? requestOrigin : this.allowedOrigins[0];
             res.setHeader('Vary', 'Origin');
-        }
-        if (origin) {
-            res.setHeader('Access-Control-Allow-Origin', origin);
+            if (requestOrigin && this.allowedOrigins.includes(requestOrigin)) {
+                res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+            }
+            // If origin is not in the allowlist, omit the header entirely —
+            // the browser will block the cross-origin request.
         }
         res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, PATCH, POST, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
     }
 
     _isRateLimited(req) {
-        const source = String(
-            req.headers['x-forwarded-for'] ||
-            req.socket?.remoteAddress ||
-            'unknown'
-        ).split(',')[0].trim();
+        // Use socket address for rate limiting — X-Forwarded-For is spoofable
+        // and would allow bypass by rotating the header value.
+        const source = String(req.socket?.remoteAddress || 'unknown');
         const now = Date.now();
         const windowStart = now - this.rateLimitWindowMs;
         this._pruneMutationRequestLog(windowStart);
         const inWindow = this._mutationRequestLog.get(source) || [];
-        inWindow.push(now);
+        // Cap array size to prevent memory exhaustion from rapid requests
+        if (inWindow.length <= this.maxMutationRequestsPerWindow * 2) {
+            inWindow.push(now);
+        }
         this._mutationRequestLog.set(source, inWindow);
         return inWindow.length > this.maxMutationRequestsPerWindow;
     }
@@ -527,37 +671,41 @@ class WebServer {
 
     _readBody(req) {
         return new Promise((resolve) => {
+            let resolved = false;
+            const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
             const chunks = [];
             let size = 0;
             req.on('data', (chunk) => {
                 size += chunk.length;
                 if (size > MAX_BODY_SIZE) {
                     req.destroy();
-                    resolve(null);
+                    done(null);
                     return;
                 }
                 chunks.push(chunk);
             });
-            req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-            req.on('error', () => resolve(null));
+            req.on('end', () => done(Buffer.concat(chunks).toString('utf8')));
+            req.on('error', () => done(null));
         });
     }
 
     _readBodyRaw(req) {
         return new Promise((resolve) => {
+            let resolved = false;
+            const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
             const chunks = [];
             let size = 0;
             req.on('data', (chunk) => {
                 size += chunk.length;
                 if (size > MAX_BODY_SIZE) {
                     req.destroy();
-                    resolve(null);
+                    done(null);
                     return;
                 }
                 chunks.push(chunk);
             });
-            req.on('end', () => resolve(Buffer.concat(chunks)));
-            req.on('error', () => resolve(null));
+            req.on('end', () => done(Buffer.concat(chunks)));
+            req.on('error', () => done(null));
         });
     }
 

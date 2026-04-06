@@ -15,15 +15,6 @@ const {
     CGATE_LEVEL_MAX
 } = require('./constants');
 
-/**
- * Handles publishing C-Bus events to MQTT topics.
- * 
- * This class is responsible for:
- * - Converting C-Bus events to MQTT messages
- * - Handling special logic for PIR sensors vs lighting devices
- * - Managing MQTT topic construction and payload formatting
- * - Publishing messages directly to MQTT (no throttle queue)
- */
 class EventPublisher {
     /**
      * Creates a new EventPublisher instance.
@@ -106,7 +97,9 @@ class EventPublisher {
         const isTiltApp = this.settings.ha_discovery_cover_tilt_app_id &&
             application === String(this.settings.ha_discovery_cover_tilt_app_id);
         
-        // Calculate level percentage for Home Assistant
+        // Calculate level percentage for Home Assistant.
+        // Math.round is intentional: HA expects integer 0-100. This means two adjacent
+        // C-Bus levels can map to the same percentage (e.g. 127 and 128 both → 50).
         const levelPercent = rawLevel !== null
             ? Math.round(rawLevel / CGATE_LEVEL_MAX * 100)
             : (actionIsOn ? 100 : 0);
@@ -116,13 +109,16 @@ class EventPublisher {
             // PIR sensors: state based on action (motion detected/cleared)
             state = actionIsOn ? MQTT_STATE_ON : MQTT_STATE_OFF;
         } else if (isCover) {
-            // Covers: state is open/closed based on level
-            // Position 0 = closed, Position > 0 = open
-            state = (levelPercent > 0) ? MQTT_STATE_ON : MQTT_STATE_OFF;
-        } else {
-            // Lighting devices: state based on action or level
+            // Covers: state is open/closed based on raw level, not quantized percent.
+            // rawLevel 1-2 rounds to 0% but the cover IS open.
             state = rawLevel !== null
-                ? ((levelPercent > 0) ? MQTT_STATE_ON : MQTT_STATE_OFF)
+                ? ((rawLevel > 0) ? MQTT_STATE_ON : MQTT_STATE_OFF)
+                : (actionIsOn ? MQTT_STATE_ON : MQTT_STATE_OFF);
+        } else {
+            // Lighting devices: state based on raw level (avoids quantization loss
+            // where rawLevel 1-2 rounds to 0% but the light IS on)
+            state = rawLevel !== null
+                ? ((rawLevel > 0) ? MQTT_STATE_ON : MQTT_STATE_OFF)
                 : (actionIsOn ? MQTT_STATE_ON : MQTT_STATE_OFF);
         }
        
@@ -296,7 +292,9 @@ class EventPublisher {
             );
         }
 
-        // Publish mode based on action: 'off' action maps to 'off', everything else to 'auto'
+        // Publish mode based on action only. C-Gate sends explicit 'off' action when
+        // the HVAC unit is turned off. rawLevel=0 is NOT used because it maps to 0°C
+        // setpoint, which is a valid (if unusual) temperature, not an off state.
         // TODO: Hardware validation — real HVAC units may report heat/cool/fan_only via
         // dedicated group addresses or extended C-Gate event fields not yet handled here.
         const mode = (action === 'off') ? 'off' : 'auto';
@@ -390,10 +388,7 @@ class EventPublisher {
         };
 
         if (this._topicCache.size >= this.topicCacheMaxEntries) {
-            const oldestKey = this._topicCache.keys().next().value;
-            if (oldestKey !== undefined) {
-                this._topicCache.delete(oldestKey);
-            }
+            this._topicCache.delete(this._topicCache.keys().next().value);
         }
         this._topicCache.set(key, topics);
         this._publishStats.topicCacheMiss += 1;
@@ -421,6 +416,16 @@ class EventPublisher {
             this._recentPublishes.delete(oldestKey);
             this._publishStats.dedupEvicted += 1;
         }
+    }
+
+    shutdown() {
+        if (this._coalesceTimer) {
+            clearImmediate(this._coalesceTimer);
+            this._coalesceTimer = null;
+        }
+        this._coalesceBuffer.clear();
+        this._recentPublishes.clear();
+        this._topicCache.clear();
     }
 
     getStats() {

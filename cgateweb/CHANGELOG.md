@@ -5,6 +5,92 @@ All notable changes to the C-Gate Web Bridge Home Assistant add-on will be docum
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-04-05
+
+### Fixed
+- **Area picker**: fetch areas via HA template API (registry endpoint removed in HA 2026.x); dropdown now shows full area names without icons
+- **Save toast**: show actual label count instead of "undefined"
+- **Tab bar scrollbar**: removed spurious scrollbar on tab bar
+
+## [1.6.0] - 2026-04-05
+
+### Changed
+- **Tabbed web interface**: replaced collapsible sections with tabs — Status, Device Labels, Live Events, Import/Export. State is preserved between tab switches.
+
+### Fixed
+- **Live Events accordion**: was not toggling due to double click handler conflict
+- **Area column width**: widened to prevent text truncation
+
+### Security
+- **Managed C-Gate hardening**: HTTPS-only download URLs, curl timeouts, 500MB file size cap, symlink rejection, file permission hardening, Java memory limits
+
+### Improved
+- **CI modernization**: GitHub Actions updated to v5/v7, test matrix Node 20+22, no deprecation warnings
+- **Test coverage**: 1153 tests, 92.7% coverage — added tests for address validation, signal handlers, event filtering, tab interface
+
+## [1.5.5] - 2026-04-04
+
+### Improved
+- **Translation refinements**: improved translations for Czech, Danish, Norwegian, Polish, Swedish, and Ukrainian
+
+## [1.5.4] - 2026-04-04
+
+### Added
+- **Complete translations**: all 16 non-English translation files updated to match the full en.yaml configuration schema (previously missing 20+ fields added in recent releases)
+- **Test coverage**: new tests for bridge diagnostics consolidated stats, line processor buffer cap, connection pool recovery via `connectionAdded`, ConfigLoader unknown settings key warning, web API dashboard/areas endpoints, CORS enforcement, and security headers
+
+## [1.5.3] - 2026-04-04
+
+### Security
+- **CORS origin leak**: disallowed origins no longer receive an `Access-Control-Allow-Origin` header; previously fell back to the first allowed origin, enabling cross-site API access from any website
+- **Rate limit bypass**: rate limiting now uses the TCP socket address instead of the spoofable `X-Forwarded-For` header
+- **MIME sniffing**: added `X-Content-Type-Options: nosniff` header to all responses
+
+### Fixed
+- **Searchable area dropdown**: area field in the label editor is now a searchable dropdown showing existing areas from Home Assistant and the label file, preventing duplicate/inconsistent area names
+- **HA area registry API**: use POST (not GET) for the Supervisor area registry endpoint; add 30-second cache to avoid repeated API calls
+- **Area dropdown UX**: prevent double-commit on click/Tab/Escape; allow ArrowUp to deselect; fix `API_BASE` variable reference
+- **MQTT reconnection**: clear `_connecting` flag on connection close so the bridge can reconnect after a failed initial connection attempt
+- **Cover state**: handle null `rawLevel` on plain `on` action (without level) by falling back to the action, matching the lighting path
+- **HVAC mode**: revert `rawLevel===0` off detection — C-Bus level 0 maps to 0°C setpoint, not an off state; only the explicit `off` action sets mode to off
+- **730 event parsing**: search for ` level=` (space-prefixed) to avoid matching inside other key names
+- **Tree message buffer**: cap at 500 entries to prevent unbounded growth when HA Discovery is disabled
+
+### Changed
+- Performance benchmarks updated: event throughput +30%, command throughput +58%, P95 latencies down 28-83%
+
+## [1.5.2] - 2026-04-04
+
+### Fixed
+- **Upgrade failure**: users upgrading from v1.4.x got "Missing option 'getall_app_periods' in root" because array-type schema fields were removed from `options` defaults; HA Supervisor requires these to exist in the saved config for validation. Restored default values for `getall_networks`, `getall_app_periods`, `ha_discovery_networks`, and `web_allowed_origins`.
+
+## [1.5.1] - 2026-04-04
+
+### Fixed
+- **730 event level parsing**: C-Gate 730 events include a UUID before the `level=N` field; the fast-path parser was extracting the leading digit from the UUID (e.g. `6` from `6c2b7f80-...`) instead of the correct level value, causing lights to appear permanently on in Home Assistant
+- Cover and lighting ON/OFF state now uses raw C-Bus level instead of quantized percentage, fixing incorrect OFF state at very low brightness levels (1-2 out of 255)
+- HVAC mode correctly reports `off` for ramp-to-zero commands
+- haDiscovery race condition: tree responses arriving before HA Discovery initialized are now buffered and replayed instead of silently dropped
+- Connection pool recovery: bridge no longer gets stuck after all pool connections go unhealthy then recover
+- Socket state verified after drain timeout to prevent writing to destroyed sockets
+- Try/catch in command data handler prevents a single malformed C-Gate line from crashing the processing loop
+
+### Added
+- Startup diagnostics summary: logs connections, networks, features, device types, and labels on boot
+- MQTT consolidated stats topic (`cbus/read/bridge/stats`): JSON with version, uptime, connections, queue, publisher, and discovery stats
+- Web dashboard endpoint (`GET /api/dashboard`): bridge health, device list with levels/labels, and recent event count
+- Unknown settings key warnings in standalone mode (catches typos in settings.js)
+- `cbusname` validation (rejects spaces, slashes, and quotes)
+- Queue drop warnings published to `hello/cgateweb/warnings` when the command queue is full
+- Configurable INCREASE/DECREASE timeout (`relativeLevelTimeoutMs`, default 5000ms)
+
+### Changed
+- HA addon config simplified from ~40 visible fields to 5 essentials; all other settings hidden by default and accessible via "Show unused optional configuration options"
+- Improved addon config descriptions with defaults and auto-detection notes
+- All resources properly cleaned up on bridge stop (event listeners, timers, ramp trackers, coalesce buffers)
+- Input validation: C-Bus address ranges, 1MB line buffer cap, WebServer body read guards, rate limit memory cap
+- TLS certificate errors now show clear file path in the error message
+
 ## [1.4.30] - 2026-03-29
 
 ### Fixed
@@ -105,17 +191,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4.19] - 2026-03-28
 
 ### Fixed
-- Managed mode: corrected C-Gate startup flags (`-s` only, removing invalid `-p`/`-e`/`-nogui` flags that caused an infinite restart loop)
-- Managed mode: updated default C-Gate download URL to current Schneider Electric location (old Clipsal CDN returned 404)
-- Managed mode: correctly handles the Schneider download package (outer zip contains a nested C-Gate zip that must be extracted separately)
-- Web server now binds to `0.0.0.0` in add-on mode, fixing 502 errors when accessing the label editor via HA Ingress
+- Multi-network support: `getall_networks` with more than one network now correctly polls all listed networks on startup and periodically, not just the first
 - Bridge diagnostic entity names are now published correctly in MQTT discovery payloads
 - Runtime status panel timer is correctly cleared when navigating away from the label editor page
 
+### Changed
+- CI workflow now includes an integration test job (managed mode, downloads C-Gate) running on push to main
+- Integration test now runs on Linux CI without a podman machine (Linux containers run natively)
+
+## [1.4.18] - 2026-03-28
+
+### Fixed
+- Corrected CI coverage threshold for `cgateConnectionPool` to match actual coverage (37.5%)
+
+## [1.4.17] - 2026-03-28
+
+### Fixed
+- Removed no-useless-catch lint error in `lineProcessor`
+
+## [1.4.16] - 2026-03-28
+
+### Fixed
+- Web server now binds to `0.0.0.0` in add-on mode, fixing 502 errors when accessing the label editor via HA Ingress; standalone mode retains `127.0.0.1` default; regression test added
+
+## [1.4.15] - 2026-03-28
+
 ### Added
-- Local Podman-based test environment for validating managed mode end-to-end without a real Home Assistant installation
+- End-to-end integration test (`test-env/integration-test.js`) validating the full managed-mode stack: C-Gate install, C-Gate start, MQTT readiness, C-Gate connectivity, bridge lifecycle, and a 10-second stability window
+
+## [1.4.14] - 2026-03-28
+
+### Fixed
+- Managed mode: correctly handles the Schneider Electric download package (outer zip contains a nested C-Gate zip that must be extracted separately)
+- Managed mode: updated default C-Gate download URL from dead Clipsal CDN to `download.se.com` (V3.3.2, publicly accessible)
 - Better error logging when a C-Gate download fails, including HTTP status code and 404-specific guidance
-- End-to-end integration test that validates the full managed-mode stack (C-Gate install, MQTT connectivity, bridge lifecycle)
+- `test-env` updated with Dockerfile, mock HA Supervisor HTTP API, and podman-compose instructions
+
+## [1.4.13] - 2026-03-28
+
+### Fixed
+- Managed mode: corrected C-Gate startup flags (`-s` only, removing invalid `-p`/`-e`/`-nogui` flags that caused an infinite restart loop)
+- `cgate-install.sh` now writes `CommandInterface.port` and `EventInterface.port` into `C-GateConfig.txt` during installation so custom ports take effect
+
+### Added
+- Local test environment (`test-env/`) with docker-compose, Mosquitto broker config, and options templates (managed-upload, managed-download, remote) for validating managed mode without a real HA Supervisor
 
 ## [1.4.12] - 2026-03-10
 
@@ -124,6 +243,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - Reduced hot-path parsing overhead in line processor
+
+## [1.4.11] - 2026-03-04
+
+### Fixed
+- Interactive command priority propagation: explicit interactive queue requests are no longer downgraded to standard priority
+
+### Added
+- Router regression coverage for command priority handling
+
+## [1.4.10] - 2026-03-04
+
+### Changed
+- Version alignment: Home Assistant add-on version synced with application version for phase 1 performance release
+
+## [1.4.9] - 2026-03-04
+
+### Changed
+- Version alignment: Home Assistant add-on version synced with application version for performance improvements release
 
 ## [1.4.8] - 2026-03-04
 
